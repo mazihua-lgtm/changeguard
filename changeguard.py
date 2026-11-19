@@ -2,9 +2,12 @@
 ChangeGuard —— AI 变更追踪 + 风险审查
 
 工作流：
-  1. SessionStart → 快照所有文件哈希
-  2. 随时调用 → 对比变化，标记风险
-  3. 输出审查报告
+  1. snapshot → 快照当前项目所有文件哈希（每个项目根目录单独存储）
+  2. check / report → 对比变化，标记风险（包括已删除文件）
+
+快照存放位置：
+  $CHANGEGUARD_HOME/snapshots/<根目录哈希>.json
+  未设置 CHANGEGUARD_HOME 时默认为 ~/.zcode/changeguard
 """
 
 import hashlib
@@ -13,34 +16,41 @@ import os
 import re
 import sys
 from datetime import datetime
+from fnmatch import fnmatch
 from pathlib import Path
 from typing import Optional
 
-STORAGE = Path.home() / ".zcode" / "changeguard"
-SNAPSHOT_FILE = STORAGE / "snapshot.json"
-HISTORY_FILE = STORAGE / "history.json"
+REPORT_NAME = "changeguard_report.md"
 
-# 忽略的目录/文件模式
-IGNORE_PATTERNS = [
+# 忽略的目录名（按路径组件精确匹配，不做子串匹配）
+IGNORE_DIR_NAMES = {
     ".git", "node_modules", "__pycache__", ".venv", "venv",
-    ".DS_Store", "*.pyc", ".next", "dist", "build",
-    ".zcode", "miaoxiang", "etf_diagnose_report.md",
-    "etf_opportunities.md", ".npm", ".cache",
-]
+    ".next", "dist", "build", ".zcode", "miaoxiang", ".npm", ".cache",
+}
 
-# 高风险文件模式
+# 忽略的文件名（精确匹配）
+IGNORE_FILE_NAMES = {
+    ".DS_Store", "etf_diagnose_report.md", "etf_opportunities.md", REPORT_NAME,
+}
+
+# 忽略的文件名通配符
+IGNORE_FILE_GLOBS = ["*.pyc"]
+
+# 高风险文件模式（对相对路径做 re.search，按路径匹配，删除的文件同样适用）
 HIGH_RISK_PATTERNS = [
-    (r"\.env$", "🔴 环境变量文件"),
-    (r"\.env\..*", "🔴 环境配置"),
-    (r"package\.json$", "🟡 依赖配置"),
-    (r"prisma/.*\.prisma$", "🟡 数据库 Schema"),
-    (r"docker.*\.yml$", "🟡 Docker 配置"),
+    (r"(^|/)\.env$", "🔴 环境变量文件"),
+    (r"(^|/)\.env\..+$", "🔴 环境配置"),
+    (r"(^|/)[^/]+\.(pem|key|p12|pfx)$", "🔴 密钥/证书文件"),
+    (r"(^|/)Dockerfile(\..+)?$", "🟡 Docker 配置"),
+    (r"(^|/)(docker|compose)[^/]*\.ya?ml$", "🟡 Docker 配置"),
+    (r"(^|/)package\.json$", "🟡 依赖配置"),
+    (r"(^|/)prisma/.*\.prisma$", "🟡 数据库 Schema"),
     (r"\.sh$", "🟡 Shell 脚本"),
-    (r"Makefile$", "🟡 构建脚本"),
-    (r"config.*\.json$", "🟡 配置文件"),
+    (r"(^|/)Makefile$", "🟡 构建脚本"),
+    (r"(^|/)config[^/]*\.json$", "🟡 配置文件"),
 ]
 
-# 风险内容检测
+# 风险内容检测（只扫描仍然存在的新增/修改文件）
 RISK_CONTENT = [
     (r'(?:api[_-]?key|apikey|secret|token|password)\s*[=:]\s*["\']?[a-zA-Z0-9_\-]{16,}["\']?',
      "🔴 疑似密钥/密码泄露"),
@@ -52,19 +62,60 @@ RISK_CONTENT = [
 
 
 # ═══════════════════════════════════════════════
-#  快照引擎
+#  存储位置（按项目根目录分开）
 # ═══════════════════════════════════════════════
 
-def _should_ignore(path: Path, root: Path) -> bool:
-    rel = str(path.relative_to(root))
-    for pat in IGNORE_PATTERNS:
-        if pat.startswith("*"):
-            if path.match(pat):
-                return True
-        elif pat in rel or rel.startswith(pat + "/"):
-            return True
-    return False
+def storage_dir() -> Path:
+    override = os.environ.get("CHANGEGUARD_HOME")
+    base = Path(override) if override else Path.home() / ".zcode" / "changeguard"
+    return base / "snapshots"
 
+
+def _resolve_root(root: Optional[Path]) -> Path:
+    return (root or Path.cwd()).resolve()
+
+
+def root_key(root: Path) -> str:
+    """根目录的稳定哈希，用作快照文件名。"""
+    return hashlib.sha256(str(_resolve_root(root)).encode("utf-8")).hexdigest()[:16]
+
+
+def snapshot_path(root: Path) -> Path:
+    return storage_dir() / f"{root_key(root)}.json"
+
+
+# ═══════════════════════════════════════════════
+#  忽略规则（按路径组件匹配）
+# ═══════════════════════════════════════════════
+
+def _is_ignored(rel_parts: tuple) -> bool:
+    """rel_parts 是相对根目录的路径组件，例如 ('src', 'dist', 'a.js')。"""
+    *dirs, name = rel_parts
+    if any(d in IGNORE_DIR_NAMES for d in dirs):
+        return True
+    if name in IGNORE_FILE_NAMES:
+        return True
+    return any(fnmatch(name, g) for g in IGNORE_FILE_GLOBS)
+
+
+def _iter_files(root: Path):
+    """遍历项目文件，忽略的目录会被整棵剪掉（不进入 node_modules 等）。"""
+    for dirpath, dirnames, filenames in os.walk(root):
+        dirnames[:] = sorted(d for d in dirnames if d not in IGNORE_DIR_NAMES)
+        base = Path(dirpath)
+        for fn in sorted(filenames):
+            p = base / fn
+            rel = p.relative_to(root)
+            if _is_ignored(rel.parts):
+                continue
+            if p.is_symlink() or not p.is_file():
+                continue
+            yield rel.as_posix(), p
+
+
+# ═══════════════════════════════════════════════
+#  快照引擎
+# ═══════════════════════════════════════════════
 
 def _hash_file(path: Path) -> str:
     try:
@@ -74,33 +125,39 @@ def _hash_file(path: Path) -> str:
         return "ERROR"
 
 
+def _file_info(path: Path) -> dict:
+    return {
+        "hash": _hash_file(path),
+        "size": path.stat().st_size,
+        "mtime": path.stat().st_mtime,
+    }
+
+
 def snapshot(root: Optional[Path] = None) -> dict:
-    """创建当前工作目录的文件快照。"""
-    root = root or Path.cwd()
-    files = {}
-    for p in root.rglob("*"):
-        if p.is_file() and not _should_ignore(p, root):
-            rel = str(p.relative_to(root))
-            files[rel] = {
-                "hash": _hash_file(p),
-                "size": p.stat().st_size,
-                "mtime": p.stat().st_mtime,
-            }
+    """创建指定项目根目录的文件快照（只影响该根目录的快照文件）。"""
+    root = _resolve_root(root)
+    files = {rel: _file_info(p) for rel, p in _iter_files(root)}
     snap = {
         "root": str(root),
         "time": datetime.now().isoformat(),
         "files": files,
     }
-    STORAGE.mkdir(parents=True, exist_ok=True)
-    SNAPSHOT_FILE.write_text(json.dumps(snap, ensure_ascii=False, indent=2))
+    path = snapshot_path(root)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(snap, ensure_ascii=False, indent=2), encoding="utf-8")
     return snap
 
 
-def load_snapshot() -> Optional[dict]:
-    """加载最近的快照。"""
-    if SNAPSHOT_FILE.exists():
-        return json.loads(SNAPSHOT_FILE.read_text())
-    return None
+def load_snapshot(root: Optional[Path] = None) -> Optional[dict]:
+    """加载该根目录的快照；快照里记录的根目录不一致时视为不存在。"""
+    root = _resolve_root(root)
+    path = snapshot_path(root)
+    if not path.exists():
+        return None
+    snap = json.loads(path.read_text(encoding="utf-8"))
+    if snap.get("root") != str(root):
+        return None
+    return snap
 
 
 # ═══════════════════════════════════════════════
@@ -109,27 +166,18 @@ def load_snapshot() -> Optional[dict]:
 
 def detect_changes(root: Optional[Path] = None) -> dict:
     """对比快照和当前状态，返回变更列表。"""
-    root = root or Path.cwd()
-    snap = load_snapshot()
+    root = _resolve_root(root)
+    snap = load_snapshot(root)
     if not snap:
         return {"error": "请先运行 snapshot 创建快照"}
 
     old_files = snap["files"]
-    new_files = {}
+    new_files = {rel: _file_info(p) for rel, p in _iter_files(root)}
 
-    for p in root.rglob("*"):
-        if p.is_file() and not _should_ignore(p, root):
-            rel = str(p.relative_to(root))
-            new_files[rel] = {
-                "hash": _hash_file(p),
-                "size": p.stat().st_size,
-                "mtime": p.stat().st_mtime,
-            }
-
-    added = set(new_files.keys()) - set(old_files.keys())
-    removed = set(old_files.keys()) - set(new_files.keys())
+    added = set(new_files) - set(old_files)
+    removed = set(old_files) - set(new_files)
     changed = []
-    for rel in set(old_files.keys()) & set(new_files.keys()):
+    for rel in set(old_files) & set(new_files):
         if old_files[rel]["hash"] != new_files[rel]["hash"]:
             changed.append({
                 "file": rel,
@@ -138,7 +186,6 @@ def detect_changes(root: Optional[Path] = None) -> dict:
                 "delta": new_files[rel]["size"] - old_files[rel]["size"],
             })
 
-    # 检测删除行数多的文件
     big_deletes = []
     for rel in removed:
         old_size = old_files[rel]["size"]
@@ -160,46 +207,45 @@ def detect_changes(root: Optional[Path] = None) -> dict:
 # ═══════════════════════════════════════════════
 
 def detect_risks(root: Optional[Path] = None) -> list[dict]:
-    """扫描变更文件中的风险内容。"""
-    root = root or Path.cwd()
+    """扫描变更中的风险。删除的文件也会按路径检查高风险模式。"""
+    root = _resolve_root(root)
     changes = detect_changes(root)
+    if "error" in changes:
+        return []
     risks = []
 
-    # 高风险文件类型
-    all_changed = set(c["file"] for c in changes.get("changed", []))
-    all_changed.update(changes.get("added", []))
-    all_changed.update(changes.get("removed", []))
-
-    for rel in all_changed:
-        filepath = root / rel
-        if not filepath.exists():
-            continue
+    # 高风险路径：新增、修改、删除的文件都检查（删除的文件只能按路径判断）
+    path_hits = set(changes["added"]) | set(changes["removed"])
+    path_hits |= {c["file"] for c in changes["changed"]}
+    for rel in sorted(path_hits):
         for pattern, label in HIGH_RISK_PATTERNS:
             if re.search(pattern, rel):
-                risks.append({"file": rel, "risk": label, "level": "high"})
+                status = "已删除" if rel in changes["removed"] else "新增/修改"
+                risks.append({"file": rel, "risk": f"{label}（{status}）", "level": "high"})
                 break
 
     # 大文件删除
-    for d in changes.get("big_deletes", []):
+    for d in changes["big_deletes"]:
         risks.append({
             "file": d["file"],
             "risk": f"🔴 删除大文件（{d['old_size']:,}字节）",
-            "level": "critical"
+            "level": "critical",
         })
 
-    # 内容风险扫描（仅文本文件）
-    for rel in all_changed:
+    # 内容风险扫描：只读仍然存在的新增/修改文件
+    readable = set(changes["added"]) | {c["file"] for c in changes["changed"]}
+    for rel in sorted(readable):
         filepath = root / rel
-        if not filepath.exists() or filepath.stat().st_size > 50000:
+        if not filepath.is_file() or filepath.stat().st_size > 50000:
             continue
         try:
             content = filepath.read_text(encoding="utf-8", errors="ignore")
-            for pattern, label in RISK_CONTENT:
-                if re.search(pattern, content, re.IGNORECASE):
-                    risks.append({"file": rel, "risk": label, "level": "critical"})
-                    break
         except Exception:
-            pass
+            continue
+        for pattern, label in RISK_CONTENT:
+            if re.search(pattern, content, re.IGNORECASE):
+                risks.append({"file": rel, "risk": label, "level": "critical"})
+                break
 
     return risks
 
@@ -210,12 +256,11 @@ def detect_risks(root: Optional[Path] = None) -> list[dict]:
 
 def generate_report(root: Optional[Path] = None) -> str:
     """生成完整的变更审查报告。"""
-    root = root or Path.cwd()
+    root = _resolve_root(root)
     changes = detect_changes(root)
-    risks = detect_risks(root)
-
     if "error" in changes:
         return f"❌ {changes['error']}"
+    risks = detect_risks(root)
 
     lines = [
         "# 🔍 AI 变更审查报告",
@@ -226,7 +271,6 @@ def generate_report(root: Optional[Path] = None) -> str:
         "",
     ]
 
-    # 摘要
     added_n = len(changes["added"])
     removed_n = len(changes["removed"])
     changed_n = len(changes["changed"])
@@ -240,7 +284,6 @@ def generate_report(root: Optional[Path] = None) -> str:
         lines.append(f"- ⚠️ 风险项：**{risk_n}** 个")
     lines.append("")
 
-    # 风险（优先展示）
     if risks:
         lines.append("## ⚠️ 风险警告")
         lines.append("")
@@ -248,14 +291,6 @@ def generate_report(root: Optional[Path] = None) -> str:
             lines.append(f"- {r['risk']}：`{r['file']}`")
         lines.append("")
 
-    # 高风险文件
-    if changes["big_deletes"]:
-        lines.append("## 🔴 大文件删除")
-        for d in changes["big_deletes"]:
-            lines.append(f"- `{d['file']}` ({d['old_size']:,} 字节)")
-        lines.append("")
-
-    # 修改详情
     if changes["changed"]:
         lines.append("## 📝 文件修改（按变动大小排序）")
         lines.append("")
@@ -266,7 +301,6 @@ def generate_report(root: Optional[Path] = None) -> str:
             lines.append(f"- ... 还有 {len(changes['changed']) - 15} 个文件")
         lines.append("")
 
-    # 新增文件
     if changes["added"]:
         lines.append(f"## 🟢 新增文件（{len(changes['added'])}）")
         lines.append("")
@@ -276,7 +310,6 @@ def generate_report(root: Optional[Path] = None) -> str:
             lines.append(f"- ... 还有 {len(changes['added']) - 10} 个")
         lines.append("")
 
-    # 安全结论
     if risk_n == 0:
         lines.append("## ✅ 安全结论")
         lines.append("未检测到风险项。所有变更看起来正常。")
@@ -293,15 +326,15 @@ def generate_report(root: Optional[Path] = None) -> str:
 
 def main():
     if len(sys.argv) < 2:
-        print("用法: changeguard [snapshot|check|report]")
+        print("用法: changeguard [snapshot|check|report] [项目目录]")
         return
 
     cmd = sys.argv[1]
-    root = Path(sys.argv[2]) if len(sys.argv) > 2 else Path.cwd()
+    root = _resolve_root(Path(sys.argv[2]) if len(sys.argv) > 2 else None)
 
     if cmd == "snapshot":
         snap = snapshot(root)
-        print(f"✅ 已快照 {len(snap['files'])} 个文件")
+        print(f"✅ 已快照 {len(snap['files'])} 个文件（{root}）")
 
     elif cmd == "check":
         changes = detect_changes(root)
@@ -315,7 +348,7 @@ def main():
     elif cmd == "report":
         report = generate_report(root)
         print(report)
-        out = root / "changeguard_report.md"
+        out = root / REPORT_NAME
         out.write_text(report, encoding="utf-8")
         print(f"\n📄 已保存: {out}")
 
